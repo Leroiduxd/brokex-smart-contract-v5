@@ -8,20 +8,15 @@ interface ICalculator {
     function isMarketOpen(uint32 assetId) external view returns (bool);
 }
 
-interface ISupraSValueFeedMinimal {
-    struct priceFeed { uint256 round; uint256 decimals; uint256 time; uint256 price; }
-    function getSvalue(uint256 _pairIndex) external view returns (priceFeed memory);
-}
-
 /**
  * Supra Pull V2 (preuve)
- * NOTE: verifyOracleProofV2 N’EST PAS view (c’est normal côté Supra).
+ * NOTE: verifyOracleProofV2 n’est PAS view (comportement normal côté Supra).
  */
 interface ISupraOraclePull {
     struct PriceInfo {
         uint256[] pairs;
         uint256[] prices;
-        uint256[] timestamp; // peut être en millisecondes selon l’endpoint
+        uint256[] timestamp; // parfois en millisecondes
         uint256[] decimal;
         uint256[] round;
     }
@@ -35,36 +30,34 @@ interface IVault {
     function settle(address user, int256 pnl) external;
 }
 
-/* ────────────────────────── Contrat ────────────────────────── */
+/* ────────────────────────── Contract ────────────────────────── */
 
 contract Trades {
-    uint256 private constant WAD = 1e18;              // qty interne
-    uint256 private constant USD_SCALE = 1e12;        // (qty1e18 * price1e6) / 1e18 => USD6
+    uint256 private constant WAD = 1e18;
     uint256 private constant LIQ_LOSS_OF_MARGIN_WAD = 8e17; // 0.8
-    uint16  private constant TOL_BPS = 5;             // 0.05% tolérance
-    uint256 private constant PROOF_MAX_AGE = 60;      // fraicheur max des preuves (s)
+    uint16  private constant TOL_BPS = 5;                   // 0.05 %
+    uint256 private constant PROOF_MAX_AGE = 60;            // fraîcheur max (s)
 
-    ICalculator public immutable calculator;
-    ISupraSValueFeedMinimal public immutable supraOracle; // lecture simple (sans preuve)
-    ISupraOraclePull public immutable supraPull;          // preuve pour execLimits/closeBatch
-    IVault public immutable vault;
+    ICalculator     public immutable calculator;
+    ISupraOraclePull public immutable supraPull;
+    IVault          public immutable vault;
 
     uint32 public nextId = 1;
 
     // States
-    uint8 private constant STATE_ORDER    = 0; // LIMIT en attente
-    uint8 private constant STATE_OPEN     = 1; // position active
-    uint8 private constant STATE_CLOSED   = 2; // fermée
-    uint8 private constant STATE_CANCELLED= 3; // annulée
+    uint8 private constant STATE_ORDER     = 0;
+    uint8 private constant STATE_OPEN      = 1;
+    uint8 private constant STATE_CLOSED    = 2;
+    uint8 private constant STATE_CANCELLED = 3;
 
-    // Close reasons (pour Removed)
+    // Removed reasons (event)
     uint8 private constant RM_CANCELLED = 0;
     uint8 private constant RM_MARKET    = 1;
     uint8 private constant RM_SL        = 2;
     uint8 private constant RM_TP        = 3;
     uint8 private constant RM_LIQ       = 4;
 
-    // Close args (API close)
+    // Close args
     uint8 private constant REASON_MARKET = 0;
     uint8 private constant REASON_SL     = 1;
     uint8 private constant REASON_TP     = 2;
@@ -75,7 +68,7 @@ contract Trades {
         address owner;       // 20B
         uint32  asset;       // 4B
         uint16  lots;        // 2B
-        uint8   flags;       // bit0=longSide ; bits4..7=state
+        uint8   flags;       // bit0=long ; bits4..7=state
         uint8   _pad0;       // 1B
         // slot 1 (prix x1e6)
         int64   entryX6;     // 0 si ORDER
@@ -83,15 +76,16 @@ contract Trades {
         int64   slX6;        // 0 si absent
         int64   tpX6;        // 0 si absent
         // slot 2
-        int64   liqX6;       // fixé à l’ouverture (MARKET: entry ; LIMIT: target)
+        int64   liqX6;       // fixé à l’ouverture
         uint16  leverageX;   // 1..100
         uint16  _pad1;
-        uint64  marginUsd6;  // USDC/USDT 1e6
+        uint64  marginUsd6;  // stablecoin 1e6
     }
 
     mapping(uint32 => Trade) public trades;
 
-    // ───────────────── EVENTS ─────────────────
+    /* ───────────────── Events ───────────────── */
+
     event Opened(
         uint32 indexed id,
         uint8  state,            // 0=ORDER, 1=OPEN
@@ -101,48 +95,30 @@ contract Trades {
         int64  entryOrTargetX6,  // entry si OPEN, target si ORDER
         int64  slX6,
         int64  tpX6,
-        int64  liqX6,            // fixé à l’ouverture
-        address indexed trader,  // append
-        uint16 leverageX         // append
+        int64  liqX6,
+        address indexed trader,
+        uint16 leverageX
     );
     event Executed(uint32 indexed id, int64 entryX6);
     event StopsUpdated(uint32 indexed id, int64 slX6, int64 tpX6);
     event Removed(uint32 indexed id, uint8 reason, int64 execX6, int256 pnlUsd6);
 
-    constructor(address _calc, address _supraRead, address _vault, address _supraPull) {
-        require(_calc != address(0) && _supraRead != address(0) && _vault != address(0) && _supraPull != address(0), "ADDR_0");
-        calculator  = ICalculator(_calc);
-        supraOracle = ISupraSValueFeedMinimal(_supraRead);
-        supraPull   = ISupraOraclePull(_supraPull);
-        vault       = IVault(_vault);
+    constructor(address _calc, address _vault, address _supraPull) {
+        require(_calc != address(0) && _vault != address(0) && _supraPull != address(0), "ADDR_0");
+        calculator = ICalculator(_calc);
+        supraPull  = ISupraOraclePull(_supraPull);
+        vault      = IVault(_vault);
     }
 
-    /* ───────────────── helpers prix ───────────────── */
+    /* ───────────────── Price via PROOF only ───────────────── */
 
-    // Lecture “simple” (sans preuve) — inchangé
-    function _priceX6FromOracle(uint32 assetId) internal view returns (int64 pX6) {
-        ISupraSValueFeedMinimal.priceFeed memory pf = supraOracle.getSvalue(assetId);
-        require(pf.price > 0, "NO_PRICE");
-        uint256 p;
-        if (pf.decimals == 6) {
-            p = pf.price;
-        } else if (pf.decimals > 6) {
-            p = pf.price / (10 ** (pf.decimals - 6));
-        } else {
-            p = pf.price * (10 ** (6 - pf.decimals));
-        }
-        require(p > 0 && p <= type(uint64).max, "PX6_RANGE");
-        return int64(uint64(p));
-    }
-
-    // Lecture via preuve Supra Pull V2 (pour execLimits/closeBatch uniquement)
     function _priceX6FromProof(bytes calldata proof, uint32 assetId, uint256 maxAgeSec)
         internal
         returns (int64 pxX6)
     {
         ISupraOraclePull.PriceInfo memory info = supraPull.verifyOracleProofV2(proof);
 
-        // trouver assetId (pairId == assetId) dans la preuve
+        // find pair == assetId
         uint256 idx = type(uint256).max;
         for (uint256 i = 0; i < info.pairs.length; ++i) {
             if (info.pairs[i] == uint256(assetId)) { idx = i; break; }
@@ -153,8 +129,8 @@ contract Trades {
         uint256 dec = info.decimal[idx];
         uint256 t   = info.timestamp[idx];
 
-        // timestamp potentiellement en ms -> normaliser en secondes
-        uint256 ts = (t > 1e12) ? (t / 1000) : t; // heuristique: > 1e12 => ms
+        // ms -> s if needed
+        uint256 ts = (t > 1e12) ? (t / 1000) : t;
         require(ts <= block.timestamp + 180, "PROOF_BAD_TS");
         require(block.timestamp >= ts && (block.timestamp - ts) <= maxAgeSec, "PROOF_TOO_OLD");
         require(raw > 0, "PROOF_PRICE_0");
@@ -165,7 +141,7 @@ contract Trades {
         return int64(uint64(p6));
     }
 
-    /* ───────────────── helpers math & flags ───────────────── */
+    /* ───────────────── Math & flags ───────────────── */
 
     function _qty1e18(uint32 assetId, uint16 lots) internal view returns (uint256) {
         (uint256 num, uint256 den) = calculator.getLot(assetId);
@@ -220,10 +196,9 @@ contract Trades {
         return (int256(qty1e18) * dX6) / int256(WAD);
     }
 
-    // Validation générique des stops selon le sens & le prix de référence (entry/target)
     function _validateStops(
         bool longSide,
-        int64 baseX6,    // entry si OPEN/MARKET, target si ORDER/LIMIT
+        int64 baseX6,
         int64 liqX6,
         int64 slX6,
         int64 tpX6
@@ -238,13 +213,7 @@ contract Trades {
         }
     }
 
-    // Helper pour émettre l'event (réduit la pression de stack)
-    function _emitOpened(
-        uint32 id,
-        uint8  state,
-        uint32 assetId,
-        address trader
-    ) internal {
+    function _emitOpened(uint32 id, uint8 state, uint32 assetId, address trader) internal {
         Trade storage t = trades[id];
         bool longSide_ = (t.flags & uint8(1)) == 1;
         int64 entryOrTargetX6_ = (state == STATE_OPEN) ? t.entryX6 : t.targetX6;
@@ -264,26 +233,10 @@ contract Trades {
         );
     }
 
-    /* ───────────────── open (MARKET/LIMIT) — inchangé (oracle simple) ───────────────── */
+    /* ───────────────── OPEN (both use PROOF) ───────────────── */
 
-    function open(
-        uint32 assetId,
-        bool   longSide,
-        uint16 leverageX,    // 1..100
-        uint16 lots,         // entier (ex: 1 => 0.01 BTC si den=100)
-        bool   isLimit,
-        int64  priceX6,      // LIMIT: target x1e6 ; MARKET: ignoré (0)
-        int64  slX6,         // 0 si absent
-        int64  tpX6          // 0 si absent
-    ) external returns (uint32 id) {
-        if (isLimit) {
-            id = _openLimit(assetId, longSide, leverageX, lots, priceX6, slX6, tpX6);
-        } else {
-            id = _openMarket(assetId, longSide, leverageX, lots, slX6, tpX6);
-        }
-    }
-
-    function _openLimit(
+    /// @notice Ouvre un LIMIT (target déjà x1e6) — ne lit PAS l’oracle.
+    function openLimit(
         uint32 assetId,
         bool   longSide,
         uint16 leverageX,
@@ -291,7 +244,7 @@ contract Trades {
         int64  targetX6,
         int64  slX6,
         int64  tpX6
-    ) internal returns (uint32 id) {
+    ) external returns (uint32 id) {
         require(targetX6 > 0, "BAD_LIMIT_PRICE");
 
         uint256 qty1e18 = _qty1e18(assetId, lots);
@@ -329,17 +282,20 @@ contract Trades {
         _emitOpened(id, STATE_ORDER, assetId, msg.sender);
     }
 
-    function _openMarket(
+    /// @notice Ouvre un MARKET en utilisant le prix extrait de la PREUVE.
+    function openMarket(
+        bytes calldata proof,
         uint32 assetId,
         bool   longSide,
         uint16 leverageX,
         uint16 lots,
         int64  slX6,
         int64  tpX6
-    ) internal returns (uint32 id) {
+    ) external returns (uint32 id) {
         require(calculator.isMarketOpen(assetId), "MARKET_CLOSED");
 
-        int64 entryX6 = _priceX6FromOracle(assetId);
+        int64 entryX6 = _priceX6FromProof(proof, assetId, PROOF_MAX_AGE);
+
         uint256 qty1e18 = _qty1e18(assetId, lots);
         require(qty1e18 > 0, "QTY_0");
 
@@ -375,7 +331,7 @@ contract Trades {
         _emitOpened(id, STATE_OPEN, assetId, msg.sender);
     }
 
-    /* ───────────────── cancel / execute (oracle simple) ───────────────── */
+    /* ───────────────── cancel / execute (LIMIT exec via PROOF) ───────────────── */
 
     function cancel(uint32 id) external {
         Trade storage t = trades[id];
@@ -387,11 +343,12 @@ contract Trades {
         emit Removed(id, RM_CANCELLED, 0, 0);
     }
 
-    function executeLimit(uint32 id) external {
+    /// @notice Exécute un LIMIT -> OPEN avec prix issu de la PREUVE.
+    function executeLimit(uint32 id, bytes calldata proof) external {
         Trade storage t = trades[id];
         require(_getState(t.flags) == STATE_ORDER, "NOT_ORDER");
 
-        int64 px = _priceX6FromOracle(t.asset);
+        int64 px = _priceX6FromProof(proof, t.asset, PROOF_MAX_AGE);
         require(_withinTol(t.targetX6, px, TOL_BPS), "PRICE_NOT_NEAR");
 
         t.entryX6 = px;
@@ -400,10 +357,10 @@ contract Trades {
         emit Executed(id, px);
     }
 
-    /* ───────────────── close (oracle simple) ───────────────── */
+    /* ───────────────── close (all use PROOF) ───────────────── */
 
-    /// @param reason 1=SL, 2=TP, 3=LIQ
-    function close(uint32 id, uint8 reason) external {
+    /// @param reason 1=SL, 2=TP, 3=LIQ  (0=MARKET non utilisé ici)
+    function close(uint32 id, uint8 reason, bytes calldata proof) external {
         require(reason == REASON_SL || reason == REASON_TP || reason == REASON_LIQ, "BAD_REASON");
         Trade storage t = trades[id];
         require(_getState(t.flags) == STATE_OPEN, "NOT_OPEN");
@@ -414,7 +371,7 @@ contract Trades {
         else if (reason == REASON_TP) { triggerX6 = t.tpX6; require(triggerX6 != 0, "NO_TP"); rm = RM_TP; }
         else { triggerX6 = t.liqX6; require(triggerX6 != 0, "NO_LIQ"); rm = RM_LIQ; }
 
-        int64 px = _priceX6FromOracle(t.asset);
+        int64 px = _priceX6FromProof(proof, t.asset, PROOF_MAX_AGE);
         require(_withinTol(triggerX6, px, TOL_BPS), "PRICE_NOT_NEAR");
 
         uint256 qty1e18 = _qty1e18(t.asset, t.lots);
@@ -427,13 +384,13 @@ contract Trades {
         emit Removed(id, rm, px, pnlUsd6);
     }
 
-    /// @notice Ferme la position au prix oracle courant (pas de tolérance), reason=MARKET
-    function closeMarket(uint32 id) external {
+    /// @notice Ferme la position au prix issu de la PREUVE (close market).
+    function closeMarket(uint32 id, bytes calldata proof) external {
         Trade storage t = trades[id];
         require(t.owner == msg.sender, "NOT_OWNER");
         require(_getState(t.flags) == STATE_OPEN, "NOT_OPEN");
 
-        int64 px = _priceX6FromOracle(t.asset);
+        int64 px = _priceX6FromProof(proof, t.asset, PROOF_MAX_AGE);
 
         uint256 qty1e18 = _qty1e18(t.asset, t.lots);
         int256 pnlUsd6  = _pnlUsd6(t.entryX6, px, (t.flags & 0x01) != 0, qty1e18);
@@ -445,7 +402,7 @@ contract Trades {
         emit Removed(id, RM_MARKET, px, pnlUsd6);
     }
 
-    /* ───────────────── update stops (avec validations) ───────────────── */
+    /* ───────────────── update stops ───────────────── */
 
     function updateStops(uint32 id, int64 newSLx6, int64 newTPx6) external {
         Trade storage t = trades[id];
@@ -463,6 +420,32 @@ contract Trades {
         emit StopsUpdated(id, newSLx6, newTPx6);
     }
 
+    /// SL only
+    function setSL(uint32 id, int64 newSLx6) external {
+        Trade storage t = trades[id];
+        require(t.owner == msg.sender, "NOT_OWNER");
+        uint8 st = _getState(t.flags);
+        require(st == STATE_ORDER || st == STATE_OPEN, "IMMUTABLE");
+        bool longSide = (t.flags & 0x01) != 0;
+        int64 baseX6  = (st == STATE_OPEN) ? t.entryX6 : t.targetX6;
+        _validateStops(longSide, baseX6, t.liqX6, newSLx6, t.tpX6);
+        t.slX6 = newSLx6;
+        emit StopsUpdated(id, t.slX6, t.tpX6);
+    }
+
+    /// TP only
+    function setTP(uint32 id, int64 newTPx6) external {
+        Trade storage t = trades[id];
+        require(t.owner == msg.sender, "NOT_OWNER");
+        uint8 st = _getState(t.flags);
+        require(st == STATE_ORDER || st == STATE_OPEN, "IMMUTABLE");
+        bool longSide = (t.flags & 0x01) != 0;
+        int64 baseX6  = (st == STATE_OPEN) ? t.entryX6 : t.targetX6;
+        _validateStops(longSide, baseX6, t.liqX6, t.slX6, newTPx6);
+        t.tpX6 = newTPx6;
+        emit StopsUpdated(id, t.slX6, t.tpX6);
+    }
+
     /* ───────────────── views ───────────────── */
 
     function stateOf(uint32 id) external view returns (uint8) {
@@ -473,9 +456,13 @@ contract Trades {
         return (trades[id].flags & 0x01) != 0;
     }
 
-    /* ───────────────── batch utils — (modifiés pour preuve) ───────────────── */
+    function getTrade(uint32 id) external view returns (Trade memory) {
+        return trades[id];
+    }
 
-    /// @notice Exécute en lot des LIMIT pour un même actif avec un prix provenant d’une preuve (fraîcheur ≤ 60s).
+    /* ───────────────── batch utils (proof) ───────────────── */
+
+    /// @notice Exécute en lot des LIMIT pour un actif avec un prix PROOF (≤ 60s).
     function execLimits(uint32 assetId, uint32[] calldata ids, bytes calldata proof)
         external
         returns (uint32 executed, uint32 skipped)
@@ -501,10 +488,10 @@ contract Trades {
         }
     }
 
-    /// @notice Ferme en lot des positions d'un même actif (1=SL, 2=TP, 3=LIQ) avec un prix provenant d’une preuve (fraîcheur ≤ 60s).
+    /// @notice Ferme en lot (1=SL,2=TP,3=LIQ) avec prix PROOF (≤ 60s).
     function closeBatch(
         uint32 assetId,
-        uint8  reason,          // 1=SL, 2=TP, 3=LIQ
+        uint8  reason,
         uint32[] calldata ids,
         bytes  calldata proof
     )
@@ -546,50 +533,4 @@ contract Trades {
             unchecked { ++closed; ++i; }
         }
     }
-
-    /// @notice Retourne la struct complète d'une position.
-    function getTrade(uint32 id) external view returns (Trade memory) {
-        return trades[id];
-    }
-
-    /// @notice Met à jour UNIQUEMENT le Stop Loss d'une position (ORDER ou OPEN).
-    /// @param id        Identifiant de la position
-    /// @param newSLx6   Nouveau SL au format prix x1e6 (0 pour retirer le SL)
-    function setSL(uint32 id, int64 newSLx6) external {
-        Trade storage t = trades[id];
-        require(t.owner == msg.sender, "NOT_OWNER");
-
-        uint8 st = _getState(t.flags);
-        require(st == STATE_ORDER || st == STATE_OPEN, "IMMUTABLE");
-
-        bool  longSide = (t.flags & 0x01) != 0;
-        int64 baseX6   = (st == STATE_OPEN) ? t.entryX6 : t.targetX6;
-
-        // Valide la cohérence SL/TP/LIQ par rapport au sens et au prix de base
-        _validateStops(longSide, baseX6, t.liqX6, newSLx6, t.tpX6);
-
-        t.slX6 = newSLx6;
-        emit StopsUpdated(id, t.slX6, t.tpX6);
-    }
-
-    /// @notice Met à jour UNIQUEMENT le Take Profit d'une position (ORDER ou OPEN).
-    /// @param id        Identifiant de la position
-    /// @param newTPx6   Nouveau TP au format prix x1e6 (0 pour retirer le TP)
-    function setTP(uint32 id, int64 newTPx6) external {
-        Trade storage t = trades[id];
-        require(t.owner == msg.sender, "NOT_OWNER");
-
-        uint8 st = _getState(t.flags);
-        require(st == STATE_ORDER || st == STATE_OPEN, "IMMUTABLE");
-
-        bool  longSide = (t.flags & 0x01) != 0;
-        int64 baseX6   = (st == STATE_OPEN) ? t.entryX6 : t.targetX6;
-
-        // Valide la cohérence SL/TP/LIQ par rapport au sens et au prix de base
-        _validateStops(longSide, baseX6, t.liqX6, t.slX6, newTPx6);
-
-        t.tpX6 = newTPx6;
-        emit StopsUpdated(id, t.slX6, t.tpX6);
-    }
-
 }
